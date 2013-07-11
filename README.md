@@ -20,10 +20,10 @@ ipvs-weightman aims to provide:
 * safe and reliable on-the-fly application of configuration file changes, including of weights for disabled realservers;
 * safe enabling/disabling of realservers for maintenance: after instructing a realserver to be re-enabled, ipvswm will not turn its weight positive until after a fresh check confirms an OK status;
 * safe and reliable resetting of realserver weights following failure detection;
-* support for multiple realserver disabled ‘reasons’; only when all reasons are removed, will the realserver be enabled;
+* support for multiple realserver disabled 'reasons'; only when all reasons are removed, will the realserver be enabled;
 * a minimal (de-duplicated) set of checkers for hosts attached to multiple virtual services;
-* a ‘services-up-on-exit’ paradigm: ipvsadm won’t bring down your load balancer just because it exits;
-* persistent storage of checker state, and realserver weights, between ipvswm restarts - so restarting ipvswm is safe and should never break your services (although it can’t check your realservers when it’s not running!);
+* a 'services-up-on-exit' paradigm: ipvsadm won't bring down your load balancer just because it exits;
+* persistent storage of checker state, and realserver weights, between ipvswm restarts - so restarting ipvswm is safe and should never break your services (although it can't check your realservers when it's not running!);
 * automatic gradual ramping-up of weights when a realserver is enabled that has been disabled for some time;
 * management console, accessible by telnet/socat/fifo, with command-line interface that provides:
   * visibility of decision engine state;
@@ -83,7 +83,7 @@ Config File Format
 ### Host configuration
 
     # HOSTS AND WEIGHTS
-    # Tag Host[:Port] <service tag1>=<weight1> <service tag2=weight2> …
+    # Tag Host[:Port] <service tag1>=<weight1> <service tag2=weight2> ...
     #
     # Host can be hostname or IP
     
