@@ -22,17 +22,16 @@ ipvs-weightman aims to provide:
 * safe and reliable resetting of realserver weights following failure detection;
 * support for multiple realserver disabled 'reasons'; only when all reasons are removed, will the realserver be enabled;
 * a minimal (de-duplicated) set of checkers for hosts attached to multiple virtual services;
-* a 'services-up-on-exit' paradigm: ipvsadm won't bring down your load balancer just because it exits;
-* persistent storage of checker state, and realserver weights, between ipvswm restarts - so restarting ipvswm is safe and should never break your services (although it can't check your realservers when it's not running!);
+* a 'safe restart' paradigm: ipvs-weightman won't bring down your virtual services when it shuts down, so you can be sure your services will remain up if it exits; persistent storage of checker state and realserver weights, between ipvs-weightman restarts, means restarting is safe and should never break your services (although it can't check your realservers when it's not running!);
 * automatic gradual ramping-up of weights when a realserver is enabled that has been disabled for some time;
 * management console, accessible by telnet/socat/fifo, with command-line interface that provides:
   * visibility of decision engine state;
   * on-the-fly manual override of realserver weight for specified virtual servers;
   * on-the-fly disabling/enabling realservers for specified virtual servers;
   * option to enable realservers gradually through specification of a ramping up time;
-  * easy scriptability (e.g. loop through active real servers: turn server off, wait for server quiescence, roll out code/config updates, restart processes/apache, turn server on smoothly)
+  * easy scriptability (e.g. loop through active real servers: turn server off, wait for server quiescence, roll out code/config updates, restart processes/apache, turn server on smoothly; wait until server weight has ramped up before moving onto next real server)
 * clear and transparent logging of decision engine actions to any combination of file, syslog or stderr;
-* configurable sorry server, activated when all realservers on a virtual service have weight zero, or indeed when there are none!
+* configurable sorry server, activated when all realservers on a virtual service have weight zero, or indeed when there are none configured!
 * optional email alerts, on enabling/disabling of sorry server;
 * automatic configuration file reloading; optionally manually-triggered config file reloading by management console command.
 
