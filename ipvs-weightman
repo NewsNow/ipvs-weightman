@@ -1,0 +1,2056 @@
+#!/usr/bin/perl
+
+################################################################################################
+# LICENCE INFORMATION
+#
+# This file is part of ipvs-weightman, an IPVS Real Server Checker and Weight Manager.
+#
+# ipvs-weightman is authored by Struan Bartlett <struan dot bartlett @ NewsNow dot co dot uk>
+# and is copyright (c) 2013 NewsNow Publishing Limited.
+#
+# ipvs-weightman is licensed for use, modification and/or distribution under the same terms
+# as Perl itself.
+#
+################################################################################################
+
+# Vocab
+#
+# VS == Virtual Server
+# Host == Real Server
+# Checker == Monitor
+
+use strict;
+
+################################################################################################
+# Config file classes
+
+package IPVS::Man::Config::Item;
+
+use Scalar::Util qw(blessed);
+
+# Serialise key value pairs excluding non-blessed references, which are assumed to be volatile.
+sub serialise {
+   return "{" . join( ",", map { ( blessed( $_[0]->{$_} ) && $_[0]->{$_}->isa('IPVS::Man::Config::Item') ) ? "$_=" . $_[0]->{$_}->serialise() : ( ref( $_[0]->{$_} ) ? () : "$_=$_[0]->{$_}" ) } sort { $a cmp $b } keys %{ $_[0] } ) . "}";
+}
+
+package IPVS::Man::Config::VS::Options;
+
+use base 'IPVS::Man::Config::Item';
+
+package IPVS::Man::Config::VS;
+
+use base 'IPVS::Man::Config::Item';
+
+package IPVS::Man::Config::Host;
+
+use base 'IPVS::Man::Config::Item';
+
+################################################################################################
+# Net::HTTP::NB wrapper for Checker logic
+
+package IPVS::Net::HTTP::Simple;
+
+use strict;
+use Net::HTTP::NB;
+use Error;
+
+our %TIMEOUTS = (
+   'Connect' => 1,
+
+   # These are the timeout for reading a chunk of data, not for completing the header/body download!
+   'Header' => 3,
+   'Body'   => 3
+);
+
+sub new {
+   my $Class = ref( $_[0] ) ? ref( $_[0] ) : $_[0];
+   shift;
+
+   my %A = @_;
+
+   return
+     bless { 'Host'     => $A{'Host'},
+             'IP'       => $A{'IP'},
+             'Path'     => $A{'Path'},
+             'Timeouts' => { 'Connect' => $A{'Timeout.Connect'} || $TIMEOUTS{'Connect'}, 'Header' => $TIMEOUTS{'Header'}, 'Body' => $TIMEOUTS{'Body'} }
+     }, $Class;
+}
+
+sub Get {
+   my $Self = shift;
+
+   my $Path;
+   my $HTTP_Host;
+
+   if( $Self->{'Path'} =~ m|^http://([^/]+)(.*)$|s ) {
+      $HTTP_Host = $1;
+      $Path      = $2;
+   }
+   else {
+      $Path = $Self->{'Path'};
+   }
+
+   my @Headers = $HTTP_Host ? ( 'Host' => $HTTP_Host ) : ();
+
+   my $s = Net::HTTP::NB->new( 'Host' => $Self->{'IP'} || $Self->{'Host'},
+                               'Timeout' => $Self->{'Timeouts'}->{'Connect'}
+   ) || die Error::Simple->new( "Connect timeout", 0 );
+
+   $s->write_request( GET => $Path, @Headers );
+
+   use IO::Select;
+   my $sel = IO::Select->new($s);
+
+   my $code;
+   my $mess;
+   my %h;
+
+   READ_HEADER: {
+      die Error::Simple->new( "Header timeout", 1 ) unless $sel->can_read( $Self->{'Timeouts'}->{'Header'} );
+      ( $code, $mess, %h ) = $s->read_response_headers;
+      redo READ_HEADER unless $code;
+   }
+
+   my $body;
+
+   while(1) {
+      die Error::Simple->new( "Body timeout", 2 ) unless $sel->can_read( $Self->{'Timeouts'}->{'Body'} );
+
+      my $buf;
+      my $n = $s->read_entity_body( $buf, 1024 );
+
+      last unless $n;
+
+      $body .= $buf;
+   }
+
+   return { 'Code'    => $code,
+            'Msg'     => $mess,
+            'Headers' => \%h,
+            'Body'    => $body
+   };
+}
+
+################################################################################################
+# package main
+
+package main;
+
+use strict;
+
+use FindBin qw($Bin);
+use lib "$Bin/";
+
+use Xebedii::Pollable;
+use Xebedii::Pollable::Child;
+use Xebedii::Pollable::File;
+use Xebedii::Pollable::Socket::TCP;
+
+use Tie::Persistent;
+use Data::Dumper;
+$Data::Dumper::Sortkeys = 1;
+$Data::Dumper::Terse    = 1;
+$Data::Dumper::Deepcopy = 1;
+
+use Sys::Syslog qw(:DEFAULT setlogsock);    # default set, plus setlogsock()
+use Sys::Syslog qw(:standard :macros);      # standard functions, plus macros
+use File::stat;
+use Time::HiRes qw( gettimeofday time );
+use Net::DNS;
+use MIME::Lite;
+use POSIX qw( ceil floor );
+use Getopt::Long;
+use IPC::Run;
+use Storable;
+use Error;
+
+################################################################################################
+# Non-persistent global data, including config options (overridden by config file)
+
+our $NP_GLOBAL = { 'HostCheckers' => {},
+                   'Options'      => {
+                                  'Management' => { 'Fifo'   => { 'Path' => '/tmp/fifo' },
+                                                    'Socket' => { 'IP'   => '127.0.0.1',
+                                                                  'Port' => 9000
+                                                    },
+                                  },
+                                  'Config' => { 'Path'        => '/etc/ipvs-weightman.conf',
+                                                'CheckPeriod' => 3,
+                                                'AutoCheck'   => 1
+                                  },
+                                  'Log' => { 'Path'   => "/var/log/ipvs-weightman.log",
+                                             'SysLog' => 0,
+                                             'StdErr' => 0
+                                  },
+                                  'Ramping' => { 'TriggerTime' => 120,
+                                                 'Duration'    => 10,
+                                  },
+                                  'DB'      => '/var/run/ipvs-weightman.db',
+                                  'IPVSADM' => '/sbin/ipvsadm',
+                                  'Email'   => {
+                                               'SMTP'    => '127.0.0.1',
+                                               'Headers' => { 'From'     => 'ipvs@localhost',
+                                                              'Reply-To' => 'webmaster@localhost',
+                                                              'To'       => 'webmaster@localhost'
+                                               }
+                                  },
+                                  'SorryServer' => { 'Fallback' => { 'Host' => 'localhost', 'IP' => '127.0.0.1', 'Title' => 'localhost' },
+                                                     'Default'  => undef
+                                  }
+                   }
+};
+
+our $NP_OPTIONS = $NP_GLOBAL->{'Options'};
+
+################################################################################################
+# Command line processing
+
+my $CLOpts = {};
+&GetOptions( $CLOpts, 'dump', 'nofork', 'console', 'h|help', 'c|config=s' );
+
+if( $CLOpts->{'h'} ) {
+   print "Usage: $0 [ <option> ]\n\n";
+   print "With no options, launches ipvs-weightman in the background.\n\n";
+   print "Options are one of:\n";
+   print "  --help | -h           show this help\n";
+   print "  --console             connect to the ipvs-weightman management console\n";
+   print "  --nofork              don't fork - stay in foreground\n";
+   print "  --dump                dump the persistent data structure to console\n";
+   print "  --config <filepath>   specify alternative config filepath\n";
+   exit(0);
+}
+
+$NP_OPTIONS->{'Config'}->{'Path'} = $CLOpts->{'c'} if $CLOpts->{'c'};
+
+if( $CLOpts->{'console'} ) {
+
+   # Load Options
+   &config_reload(1);
+   exec "socat - tcp4:$NP_OPTIONS->{'Management'}->{'Socket'}->{'IP'}:$NP_OPTIONS->{'Management'}->{'Socket'}->{'Port'}";
+   exit(0);
+}
+
+################################################################################################
+# Management console help text
+
+my $HELP = "# Command Help\n";
+$HELP .= join( "\n",
+               map { "#    $_" } ( 'help | h | ?',
+                                   'show [ vs | hosts ]',
+                                   'show hosts for <vs1,vs2,...>',
+                                   'show hosts [<h1>,<h2>,...] for <vs1,vs2,...>',
+                                   'show host <host> for <vs1,vs2,...>',
+                                   'dump [ status | options | checkers ]',
+                                   'dump [ hosts | host <host> ] ',
+                                   'dump vs [<vs>]',
+                                   'set host <host> [ off | on [ [in] <weight ramp duration> ] ]',
+                                   'set host <host> off [on|for|in] vs <vs1,vs2,...> [for <reason1,reason2>]',
+                                   'set host <host> on [on|for|in] vs <vs1,vs2,...> [for <reason1,reason2>] [[in] <weight ramp duration>]',
+                                   'config [ reload | diff ]',
+                                   'history',
+                                   'log level <n>',
+                                   '!  - run last \'show\' command again',
+                                   'quit | exit | CTRL+D'
+               )
+);
+
+################################################################################################
+# time, Log and Email utility functions
+
+sub dtime {
+
+   # If fractional time argument provided, use it; otherwise call gettimeofday.
+   my ( $Seconds, $Microseconds ) = ( $_[0] && sprintf( "%.6f", $_[0] ) =~ /^(\d+)(?:\.(\d+))?$/ ? ( $1, $2 ) : gettimeofday );
+
+   # Get fractions-of-a-second portion of time, and discard leading zero.
+   $Microseconds = substr( sprintf( '%.6f', $Microseconds / 1000000 ), 1 );
+
+   # The dates in the logs are in GMT, so get the current GMT time
+   my (@GMT) = gmtime($Seconds);
+
+   # Common Log Format
+   return sprintf "%04d-%02d-%02d %02d:%02d:%02d%s", $GMT[5] + 1900, $GMT[4] + 1, @GMT[ 3, 2, 1, 0 ], $Microseconds;
+}
+
+my $OPENSYSLOG;
+
+sub Log {
+
+   my $l = sprintf "%s|%d|", dtime, $$;
+
+   if( open( LOG, ">>", $NP_OPTIONS->{'Log'}->{'Path'} ) ) {
+      print LOG $l . $_[0] . "\n";
+      close LOG;
+   }
+
+   if( $NP_OPTIONS->{'Log'}->{'SysLog'} ) {
+      openlog( "ipvs-weightman", "ndelay,nofatal,pid" ) unless $OPENSYSLOG++;
+      syslog( LOG_INFO, $_[0] );
+   }
+
+   # Logging to stderr only available in foreground nofork mode
+   return unless $CLOpts->{'nofork'};
+
+   if( $NP_OPTIONS->{'Log'}->{'StdErr'} ) {
+      print STDERR $l . $_[0] . "\n";
+   }
+
+}
+
+sub Email {
+   my $Args = shift;
+
+   my $Msg = MIME::Lite->new( %{ $NP_OPTIONS->{'Email'}->{'Headers'} },
+                              'Subject' => $Args->{'Subject'},
+                              'Data'    => $Args->{'Data'}
+   );
+
+   eval {
+      &Log("Sending email \"$Args->{'Subject'}\" to \"$NP_OPTIONS->{'Email'}->{'Headers'}->{'To'}\"");
+      if( $NP_OPTIONS->{'Email'}->{'SMTP'} ) {
+         $Msg->send( 'smtp', $NP_OPTIONS->{'Email'}->{'SMTP'} );
+      }
+      else {
+         $Msg->send;
+      }
+   };
+   if($@) {
+      &Log("Email \"$Args->{'Subject'}\" failed with error '$@'");
+   }
+}
+
+################################################################################################
+# Prepare globals and signal handlers for Tie::Persistent DB.
+
+our $GLOBAL;
+
+my $SigSub = sub {
+   &Log("Preparing to exit on signal '$_[0]'");
+
+   my $ev = eval {
+
+      &Log("Shutting down checkers...");
+
+      my $NP = $NP_GLOBAL->{'HostCheckers'};
+      foreach my $Host ( keys %$NP ) {
+         foreach my $Checker ( keys %{ $NP->{$Host} } ) {
+
+            next unless $NP->{$Host}->{$Checker}->{'Child'};
+
+            &Log("Shutting down Host/Checker '$Host/$Checker'");
+            $NP->{$Host}->{$Checker}->{'Child'}->Terminate;
+
+            # Unneeded, since we're about to exit.
+            delete $NP->{$Host}->{$Checker}->{'Child'};
+         }
+      }
+
+      &Log("Storing persistent data...");
+      untie $GLOBAL;
+
+      return 1;
+   };
+
+   unless($ev) {
+      my $E = ref($@) ? &Dumper($@) : $@;
+      &Log("Caught unexpected exception during shutdown '$@'");
+   }
+
+   &Log("Exiting, following signal '$_[0]'.");
+   exit(0);
+};
+
+our @TrapSignals = qw( INT TERM );
+@SIG{@TrapSignals} = ($SigSub) x (@TrapSignals);
+$SIG{'PIPE'} = 'IGNORE';
+
+################################################################################################
+# IPC::Run::run wrapper
+
+sub Cmd {
+   my $Context = shift;
+   my $Command = shift;
+
+   my @Cmd = split( /\s+/, $Command );
+
+   my @Log = ('Running');
+   if( exists $Context->{'VS'} && exists $Context->{'Host'} ) {
+      push( @Log, "(for VS/Host '$Context->{'VS'}/$Context->{'Host'}')" );
+   }
+   else {
+      push( @Log, "(for VS '$Context->{'VS'}')" )     if exists $Context->{'VS'};
+      push( @Log, "(for Host '$Context->{'Host'}')" ) if exists $Context->{'Host'};
+   }
+
+   push( @Log, "'" . join( ' ', @Cmd ) . "'" );
+
+   my $Lg = join( ' ', @Log );
+
+   my $in = '';
+   my $out;
+   my $err;
+
+   my $Eval = eval {
+      IPC::Run::run \@Cmd, \$in, \$out, \$err, IPC::Run::timeout(5);
+      return 1;
+   };
+
+   if( !$Eval ) {
+      my $E = $@;
+      chomp $E;
+      $Lg .= ", which died with \$\@ '$E' and \$! '$!'";
+      &Log($Lg);
+      return -1;
+   }
+
+   my $E = $? >> 8;    # 0 <= $E <= 255
+
+   if( $? == -1 ) {
+      $Lg .= ", which failed to execute, with $! '$!'";
+      &Log($Lg);
+      return -2;
+   }
+
+   if( $? & 127 ) {
+      $Lg .= sprintf( 'which died with signal %d, %s coredump', ( $? & 127 ), ( $? & 128 ) ? 'with' : 'without' );
+      &Log($Lg);
+      return -3;
+   }
+
+   $Lg .= sprintf( ", which exited with status %d [%s]", $E, $E ? 'FAIL' : 'OK' );
+
+   chomp $out;
+   chomp $err;
+   $Lg .= sprintf( ", and stdout '%s'", $out ) if $out;
+   $Lg .= sprintf( ", and stderr '%s'", $err ) if $err;
+
+   $E = -10 if $err =~ /Destination already exists/i;
+
+   &Log($Lg) if $GLOBAL->{'Log'}->{'Level'} >= 10 || $E;
+
+   return $E;
+}
+
+################################################################################################
+# Checker template
+
+my $CheckerTemplate = Xebedii::Pollable::Child->new( '.I/O'      => 'Object',
+                                                     '.Title'    => "HostChecker",
+                                                     '.Function' => \&do_check,
+                                                     '.Signals'  => { 'INT' => 'DEFAULT', 'TERM' => 'DEFAULT', 'PIPE' => 'IGNORE' },
+                                                     '.Args' => { 'Path' => '/some/test/path/' }
+);
+
+################################################################################################
+# Net::DNS wrapper and cache
+
+my $DNS;
+
+sub DNS_Lookup {
+   return $DNS->{ $_[0] } if exists $DNS->{ $_[0] };
+
+   my $res = Net::DNS::Resolver->new( config_file => '/etc/resolv.conf' );
+   my $query = $res->search( $_[0] );
+
+   return unless $query;
+
+   foreach my $rr ( $query->answer ) {
+      do { $DNS->{ $_[0] } = $rr->address;  return $rr->address; }  if $rr->type eq "A";
+      do { $DNS->{ $_[0] } = $rr->ptrdname; return $rr->ptrdname; } if $rr->type eq "PTR";
+   }
+
+   return undef;
+}
+
+sub DNS_Resolve_To_IP {
+   my $HP = shift;
+
+   # We want an IP or IP:Port; if we've got one, return.
+   return $HP if $HP =~ /^\d+\.\d+\.\d+\.\d+(:\d+)?$/s;
+
+   if( $HP =~ /^([^\:]+)\:(\d+)$/s ) {
+      my $H = $1;
+      my $P = $2;
+
+      return &DNS_Lookup($H) . ":$P";
+   }
+
+   return &DNS_Lookup($HP);
+}
+
+sub DNS_Resolve_To_Name {
+   my $HP = shift;
+
+   # We want an Hostname or Hostname:Port; if we've got one, return.
+   return $HP unless $HP =~ /^\d+\.\d+\.\d+\.\d+(:\d+)?$/s;
+
+   if( $HP =~ /^([^\:]+)\:(\d+)$/s ) {
+      my $H = $1;
+      my $P = $2;
+
+      return &DNS_Lookup($H) . ":$P";
+   }
+
+   return &DNS_Lookup($HP);
+}
+
+################################################################################################
+# Code for parsing ipvsadm table
+
+sub IPVS_Parse {
+   open( VS, "</proc/net/ip_vs" ) || return undef;
+
+   my $VS_Host;
+   my $VS_Port;
+   my $Table;
+
+   while( local $_ = <VS> ) {
+      chomp;
+
+      if(/^([a-z]+)\s+([0-9a-f]{8}):([0-9a-f]{4})\s+([a-z]+)\s*$/is) {
+         $VS_Port = hex($3);
+         $VS_Host = join( '.', map { hex($_) } $2 =~ /(..)/g );
+      }
+      elsif (/^\s+\-\>\s+([0-9a-f]{8}):([0-9a-f]{4})\s+([a-z]+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$/is) {
+         my $RS_Port    = hex($2);
+         my $RS_Weight  = int($4);
+         my $RS_ActConn = int($5);
+         my $RS_Host    = join( '.', map { hex($_) } $1 =~ /(..)/g );
+
+         $Table->{"$VS_Host:$VS_Port"}->{"$RS_Host:$RS_Port"} = { 'Weight' => $RS_Weight, 'ActiveConn' => $RS_ActConn };
+      }
+   }
+
+   close VS;
+
+   return $Table;
+}
+
+################################################################################################
+# Add/Remove Sorry Server for VS(s)
+
+sub IPVS_Update_VS {
+   my $VS = shift;
+
+   my %LogVS;
+   my $LogVS;
+   my $EmailLogVS;
+
+   my $W = 0;
+   while( my ( $Host_Title, $Host ) = each %{ $GLOBAL->{'Hosts'} } ) {
+      if( exists $Host->{'VSW'}->{ $VS->{'Title'} } ) {
+         my $VSW = $Host->{'VSW'}->{ $VS->{'Title'} };
+         my $w   = $VSW->{'State'}->{'DesiredWeight'};
+         $LogVS{$Host_Title} = [ $w, exists( $VSW->{'TimeDisabled'} ) && dtime( $VSW->{'TimeDisabled'} ), exists( $VSW->{'TimeDisabledCleared'} ) && dtime( $VSW->{'TimeDisabledCleared'} ) ];
+         $W += $w;
+      }
+   }
+
+   $LogVS = "Updating VS '$VS->{'Title'}':";
+   foreach my $Host_Title ( sort { $a cmp $b } keys %LogVS ) {
+      my $S;
+      $S =
+        $LogVS{$Host_Title}->[0]
+        ? "$Host_Title enabled \@ " . $LogVS{$Host_Title}->[2]
+        : "$Host_Title disabled \@ " . $LogVS{$Host_Title}->[1];
+
+      $LogVS      .= " $S;";
+      $EmailLogVS .= " - $S\n";
+   }
+
+   if( $W == 0 ) {
+      if( !( exists( $VS->{'State'}->{'Sorry'} ) || $VS->{'State'}->{'Sorry'} ) ) {
+
+         my $VS_Opt_SS = $VS->{'Options'}->{'sorry_server'};
+         my $G_Hosts   = $GLOBAL->{'Hosts'};
+         my $NP_SS     = $NP_OPTIONS->{'SorryServer'};
+
+         my $SS =
+             ( $VS_Opt_SS          && $G_Hosts->{$VS_Opt_SS} )            ? $G_Hosts->{$VS_Opt_SS}
+           : ( $NP_SS->{'Default'} && $G_Hosts->{ $NP_SS->{'Default'} } ) ? $G_Hosts->{ $NP_SS->{'Default'} }
+           :                                                                $NP_SS->{'Fallback'};
+
+         if( &_IPVS_Add_RealServer( $VS, $SS, 1 ) ) {
+            $VS->{'State'}->{'Sorry'}       = time;
+            $VS->{'State'}->{'SorryServer'} = Storable::dclone($SS);
+            &Log( $LogVS . ", so Sorry Server enabled" );
+            &Email( { 'Subject' => "VS '$VS->{'Title'}' FAIL",
+                      'Data'    => "Sorry Server '$VS->{'State'}->{'SorryServer'}->{'Title'}' enabled on VS '$VS->{'Title'}' at " . dtime . " following:\n\n$EmailLogVS"
+                    }
+            ) if $VS->{'Options'}->{'email'} =~ /^(true|yes|1)$/i;
+         }
+         else {
+            &Log( $LogVS . ", but failed to enable Sorry Server" );
+         }
+      }
+   }
+   else {
+      if( exists( $VS->{'State'}->{'Sorry'} ) && $VS->{'State'}->{'Sorry'} ) {
+
+         if( &IPVS_Remove_RealServer( $VS, $VS->{'State'}->{'SorryServer'} ) ) {
+            my $d = sprintf( "%.1f", time - $VS->{'State'}->{'Sorry'} );
+            &Email( { 'Subject' => "VS '$VS->{'Title'}' OK (after ${d}s)",
+                      'Data'    => "Sorry Server '$VS->{'State'}->{'SorryServer'}->{'Title'}' disabled on VS '$VS->{'Title'}' at " . dtime . " after ${d}s, following:\n\n$EmailLogVS"
+                    }
+            ) if $VS->{'Options'}->{'email'} =~ /^(true|yes|1)$/i;
+
+            delete $VS->{'State'}->{'Sorry'};
+            delete $VS->{'State'}->{'SorryServer'};
+
+            &Log( $LogVS . ", so Sorry Server disabled" );
+         }
+         else {
+
+            # FIXME:
+            # It's not ideal to mark the sorry server as deleted, but it might never have been correctly added.
+            # In due course we will move to a system where ipvswm compares desired state (new config) with actual state (from /proc/net/ip_vs),
+            # instead of with previous config, in order to derive the necessary changes.
+            delete $VS->{'State'}->{'Sorry'};
+            delete $VS->{'State'}->{'SorryServer'};
+            &Log( $LogVS . ", but failed to disable Sorry Server" );
+         }
+
+      }
+   }
+
+}
+
+sub IPVS_Update_VSs {
+   while( my ( $VS_Title, $VS ) = each %{ $GLOBAL->{'VSs'} } ) {
+      &IPVS_Update_VS($VS);
+   }
+}
+
+################################################################################################
+# Evaluate the desired weight for a VS/Host pair
+
+sub IPVS_Eval_Desired_Weight {
+   my $VS   = shift;
+   my $Host = shift;
+
+   my $HostSVC = $Host->{'VSW'}->{ $VS->{'Title'} };
+
+   my $DesiredWeight = 0;
+
+   my $Status     = $Host->{'Checkers'}->{ $VS->{'Checker'} }->{'Status'};
+   my $LastUpdate = $Host->{'Checkers'}->{ $VS->{'Checker'} }->{'LastUpdate'};
+
+   my $LogVS = "Evaluating VS/Host '$VS->{'Title'}/$Host->{'Title'}': Weight=$HostSVC->{'Weight'}; Checker='$Status\@$LastUpdate'";
+
+   # If Host is disabled, or the VS is disabled, the weight is zero.
+   if( $Host->{'Disabled'} || $HostSVC->{'Disabled'} ) {
+      unless( exists $HostSVC->{'TimeDisabled'} ) {
+         $HostSVC->{'TimeDisabled'} = time;
+         delete $HostSVC->{'TimeDisabledCleared'};
+
+         &Log("$LogVS: Setting DesiredWeight=0, TimeDisabled=$HostSVC->{'TimeDisabled'}");
+      }
+
+      # No transition expected.
+      $HostSVC->{'TStatus'} = '0-DISABLED';
+
+      return $HostSVC->{'State'}->{'DesiredWeight'} = 0;
+   }
+
+   # If the checker hasn't passed;
+   #   or has, but not since the host was disabled;
+   #   or has since the host was disabled, but not since the host was requested re-enabled:
+   #     then set and return weight zero. At the same time, eliminate any ramping deadline.
+   if( my $Reason =
+         $Status ne 'PASS' ? ' != PASS'
+       : $LastUpdate <= $HostSVC->{'TimeDisabled'} ? " < TimeDisabled=$HostSVC->{'TimeDisabled'}"
+       : $LastUpdate <= $HostSVC->{'LastEnabled'}  ? " < LastEnabled=$HostSVC->{'LastEnabled'}"
+       : ''
+     ) {
+
+      # Reset the deadline, if checker fails, in case WeightRampDeadline has already been specified (and ramp-up started)
+      delete $HostSVC->{'WeightRampDeadline'};
+
+      &Log("$LogVS$Reason: Setting DesiredWeight=0")
+        if $HostSVC->{'State'}->{'Weight'} != 0 || $GLOBAL->{'Log'}->{'Level'} >= 10;
+
+      unless( exists $HostSVC->{'TimeDisabled'} ) {
+         $HostSVC->{'TimeDisabled'} = time;
+         delete $HostSVC->{'TimeDisabledCleared'};
+      }
+
+      # Awaiting transition.
+      $HostSVC->{'TStatus'} = '1-AWAITPASS';
+
+      return $HostSVC->{'State'}->{'DesiredWeight'} = 0;
+   }
+
+   # Checker has passed.
+   # If ramping isn't specified, then check how long has elapsed since the host was last disabled.
+   # If > TriggerTime seconds since last disabled, then set a RampDuration.
+   # Otherwise set and return the full weight.
+   # Either way, delete TimeDisabled.
+   if( !$HostSVC->{'WeightRampDuration'} ) {
+
+      if( exists $HostSVC->{'TimeDisabled'} ) {
+         my $ElapsedTimeDisabled = time - $HostSVC->{'TimeDisabled'};
+
+         if( $ElapsedTimeDisabled >= $NP_OPTIONS->{'Ramping'}->{'TriggerTime'} ) {
+
+            &Log("$LogVS: ElapsedTimeDisabled=$ElapsedTimeDisabled > $NP_OPTIONS->{'Ramping'}->{'TriggerTime'}: Setting WeightRampDuration=$NP_OPTIONS->{'Ramping'}->{'Duration'}");
+
+            # Otherwise, set WeightRampDuration.
+            $HostSVC->{'WeightRampDuration'} = $NP_OPTIONS->{'Ramping'}->{'Duration'};
+         }
+         else {
+            &Log("$LogVS: ElapsedTimeDisabled=$ElapsedTimeDisabled <= $NP_OPTIONS->{'Ramping'}->{'TriggerTime'}: Not ramping");
+         }
+      }
+   }
+
+   # We're going to be re-enabling this host on this service one way or another now, and don't need this anymore, so time to get rid of it.
+   delete $HostSVC->{'TimeDisabled'};
+   $HostSVC->{'TimeDisabledCleared'} = time;
+
+   # If ramping (still) isn't specified, then set and return the full weight.
+   if( !$HostSVC->{'WeightRampDuration'} ) {
+
+      &Log("$LogVS: Setting DesiredWeight=$HostSVC->{'Weight'}")
+        if $HostSVC->{'State'}->{'DesiredWeight'} != $HostSVC->{'Weight'} || $GLOBAL->{'Log'}->{'Level'} >= 10;
+
+      # Transition complete.
+      $HostSVC->{'TStatus'} = '0-ENABLED';
+      $HostSVC->{'TMinus'}  = 0;
+
+      return $HostSVC->{'State'}->{'DesiredWeight'} = $HostSVC->{'Weight'};
+   }
+
+   # Checker has passed.
+   # Ramping is specified.
+   # If no ramp-up deadline has been set yet, then set it.
+
+   if( !$HostSVC->{'WeightRampDeadline'} ) {
+      $HostSVC->{'WeightRampDeadline'} = time + $HostSVC->{'WeightRampDuration'};
+      &Log("$LogVS: Setting WeightRampDeadline=$HostSVC->{'WeightRampDeadline'}");
+   }
+
+   my $T = time;
+
+   # If we've passed the ramp-up deadline, then terminate the ramp-up and set and return the full weight.
+   if( $T >= $HostSVC->{'WeightRampDeadline'} ) {
+      &Log("$LogVS T=$T >= WeightRampDeadline=$HostSVC->{'WeightRampDeadline'}: Setting DesiredWeight=$HostSVC->{'Weight'}");
+      delete $HostSVC->{'WeightRampDuration'};
+      delete $HostSVC->{'WeightRampDeadline'};
+
+      # Transition complete.
+      $HostSVC->{'TStatus'} = '0-ENABLED';
+      $HostSVC->{'TMinus'}  = 0;
+
+      return $HostSVC->{'State'}->{'DesiredWeight'} = $HostSVC->{'Weight'};
+   }
+
+   my $TMinus = $HostSVC->{'WeightRampDeadline'} - time;
+
+   # Calculate the weight based on the current time, and ramp-up deadline.
+   #
+   # Linear ramp-up formula.
+   # New Weight = End_Weight x Time_Elapsed / RampDuration
+   # $DesiredWeight = ceil( $HostSVC->{'Weight'} * $T_Elapsed / $HostSVC->{'WeightRampDuration'} );
+
+   # Slower ramp-up formula.
+   # New Weight = End_Weight / ( RampDuration - Time_Elapsed + 1 )
+   # $DesiredWeight = ceil( $HostSVC->{'Weight'} / ( $HostSVC->{'WeightRampDuration'} - $T_Elapsed + 1 ) );
+   # $DesiredWeight = ceil( $HostSVC->{'Weight'} / ( $HostSVC->{'WeightRampDeadline'} - $T ) + 1 );
+   $DesiredWeight = ceil( $HostSVC->{'Weight'} / ( ( $TMinus > 0 ? $TMinus : 0 ) + 1 ) );
+
+   &Log( sprintf( "$LogVS WeightRampDeadline=%d: Setting DesiredWeight=$DesiredWeight", $HostSVC->{'WeightRampDeadline'} - $T ) );
+
+   # Transition in progress.
+   $HostSVC->{'TStatus'} = '1-RAMPING';
+
+   # Time to completed state change is TMinus.
+   $HostSVC->{'TMinus'} = $TMinus;
+
+   # Return that weight.
+   return $HostSVC->{'State'}->{'DesiredWeight'} = $DesiredWeight;
+}
+
+################################################################################################
+# Update weight for Host(s)
+
+sub IPVS_Update_RealServer {
+   my $VS     = shift;
+   my $Host   = shift;
+   my $Weight = shift;
+   my $Method = shift || '-m';
+
+   my $HostSVC = $Host->{'VSW'}->{ $VS->{'Title'} };
+
+   my $DesiredWeight = defined($Weight) ? $Weight : &IPVS_Eval_Desired_Weight( $VS, $Host );
+
+   # DEFINITIONS
+   # HostSVC->Weight: user-specified Weight (that may be set in whole, part, or not at all)
+   # HostSVC->State->DesiredWeight: system-calculated Weight before being set (may be zero if host disabled or failing checker test)
+   # HostSVC->State->Weight: calculated Weight once set
+   if( $HostSVC->{'State'}->{'Weight'} != $DesiredWeight ) {
+
+      my $Port = $Host->{'Port'} || $VS->{'Host_Port_Default'};
+
+      &Log("Updating VS/Host '$VS->{'Title'}/$Host->{'Title'}' with '$NP_OPTIONS->{'IPVSADM'} -e -t $VS->{'Service_IP'}:$VS->{'Service_Port'} [$VS->{'Service'}] -r $Host->{'IP'}:$Port [$Host->{'Host'}:$Port] $Method -w $DesiredWeight'");
+      $HostSVC->{'State'}->{'Weight'} = $DesiredWeight
+        unless &Cmd( { 'VS' => $VS->{'Title'}, 'Host' => $Host->{'Title'} }, "$NP_OPTIONS->{'IPVSADM'} -e -t $VS->{'Service_IP'}:$VS->{'Service_Port'} -r $Host->{'IP'}:$Port $Method -w $DesiredWeight" );
+   }
+
+   # Check whether sorry servers need to be added or removed.
+   # It's unclear whether it helps to do this in the rare event that &Cmd fails.
+   # On the upside it might result in enabling a sorry server even if a real server that should be off failed to be disabled.
+   &IPVS_Update_VS($VS);
+}
+
+sub IPVS_Update_RealServers {
+   my $Host = shift;
+
+   foreach my $VS ( keys %{ $Host->{'VSW'} } ) {
+
+      # Update the weight for each VS specified for $Host, but ONLY if $VS is truly globally defined.
+      &IPVS_Update_RealServer( $GLOBAL->{'VSs'}->{$VS}, $Host ) if defined $GLOBAL->{'VSs'}->{$VS};
+   }
+
+}
+
+################################################################################################
+# Add/Remove Host
+
+sub IPVS_Add_RealServer {
+   my $VS     = shift;
+   my $Host   = shift;
+   my $Weight = shift;
+   my $Method = shift;
+
+   &IPVS_Update_VS($VS) if _IPVS_Add_RealServer( $VS, $Host, $Weight, $Method );
+}
+
+sub _IPVS_Add_RealServer {
+   my $VS     = shift;
+   my $Host   = shift;
+   my $Weight = shift;
+   my $Method = shift || '-m';
+
+   my $HostSVC = $Host->{'VSW'}->{ $VS->{'Title'} };
+
+   my $DesiredWeight = defined($Weight) ? $Weight : &IPVS_Eval_Desired_Weight( $VS, $Host );
+
+   my $Port = $Host->{'Port'} || $VS->{'Host_Port_Default'};
+
+   &Log("Adding VS/Host '$VS->{'Title'}/$Host->{'Title'}' with '$NP_OPTIONS->{'IPVSADM'} -a -t $VS->{'Service_IP'}:$VS->{'Service_Port'} [$VS->{'Service'}] -r $Host->{'IP'}:$Port [$Host->{'Host'}:$Port] $Method -w $DesiredWeight'");
+
+   my $R = &Cmd( { 'VS' => $VS->{'Title'}, 'Host' => $Host->{'Title'} }, "$NP_OPTIONS->{'IPVSADM'} -a -t $VS->{'Service_IP'}:$VS->{'Service_Port'} -r $Host->{'IP'}:$Port $Method -w $DesiredWeight" );
+
+   if( $R == -10 ) {
+      &Log("Updating VS/Host '$VS->{'Title'}/$Host->{'Title'}' with '$NP_OPTIONS->{'IPVSADM'} -e -t $VS->{'Service_IP'}:$VS->{'Service_Port'} [$VS->{'Service'}] -r $Host->{'IP'}:$Port [$Host->{'Host'}:$Port] $Method -w $DesiredWeight'");
+      $R = &Cmd( { 'VS' => $VS->{'Title'}, 'Host' => $Host->{'Title'} }, "$NP_OPTIONS->{'IPVSADM'} -e -t $VS->{'Service_IP'}:$VS->{'Service_Port'} -r $Host->{'IP'}:$Port $Method -w $DesiredWeight" );
+   }
+
+   return 0 if $R;
+
+   $HostSVC->{'State'}->{'Weight'} = $DesiredWeight;
+
+   return 1;
+}
+
+sub IPVS_Remove_RealServer {
+   my $VS   = shift;
+   my $Host = shift;
+
+   my $Port = $Host->{'Port'} || $VS->{'Host_Port_Default'};
+
+   &Log("Removing VS/Host '$VS->{'Title'}/$Host->{'Title'}' with '$NP_OPTIONS->{'IPVSADM'} -d -t $VS->{'Service_IP'}:$VS->{'Service_Port'} [$VS->{'Service'}] -r $Host->{'IP'}:$Port [$Host->{'Host'}:$Port]'");
+   return !&Cmd( { 'VS' => $VS->{'Title'}, 'Host' => $Host->{'Title'} }, "$NP_OPTIONS->{'IPVSADM'} -d -t $VS->{'Service_IP'}:$VS->{'Service_Port'} -r $Host->{'IP'}:$Port" );
+}
+
+################################################################################################
+# Add/Remove VS
+
+sub IPVS_Add_VServer {
+   my $VS = shift;
+
+   &Log("Adding VS '$VS->{'Title'}' with '$NP_OPTIONS->{'IPVSADM'} -A -t $VS->{'Service_IP'}:$VS->{'Service_Port'} [$VS->{'Service'}] -s wrr'");
+   return !&Cmd( { 'VS' => $VS->{'Title'} }, "$NP_OPTIONS->{'IPVSADM'} -A -t $VS->{'Service_IP'}:$VS->{'Service_Port'} -s wrr" );
+}
+
+sub IPVS_Remove_VServer {
+   my $VS = shift;
+
+   &Log("Removing VS '$VS->{'Title'}' with '$NP_OPTIONS->{'IPVSADM'} -D -t $VS->{'Service_IP'}:$VS->{'Service_Port'} [$VS->{'Service'}]'");
+   return !&Cmd( { 'VS' => $VS->{'Title'} }, "$NP_OPTIONS->{'IPVSADM'} -D -t $VS->{'Service_IP'}:$VS->{'Service_Port'}" );
+}
+
+################################################################################################
+# Wrapper for IPVS::Net::HTTP::Simple, for checking a webserver
+
+sub do_check {
+   my $Self = shift;
+   my $Args = $Self->{'.Args'};
+
+   # Prevent excessive respawning
+   $0 = "$Self->{'.CommandLine'}";
+   sleep 1;
+
+   while(1) {
+
+      next if eval {
+         my $g = IPVS::Net::HTTP::Simple->new( 'IP' => $Args->{'IP'}, 'Host' => $Args->{'Host'}, 'Path' => $Args->{'Path'} );
+         my $R = $g->Get();
+
+         die Error::Simple( 'Unexpected return from IPVS::Net::HTTP::Simple::Get', 0 ) unless $R && ref($R) eq 'HASH';
+
+         # Check here for returned webpage status/body being what we want.
+         my $time = time;
+
+         if( $R->{'Code'} == 200 ) {
+            $Self->Send( [ $time, 'PASS', $R ] );
+            $0 = "$Self->{'.CommandLine'} PASS \@ " . $time;
+         }
+         else {
+            $Self->Send( [ $time, 'FAIL', $R ] );
+            $0 = "$Self->{'.CommandLine'} FAIL (" . join( '|', @$R{ 'Code', 'Msg', 'Body' } ) . ") \@ " . $time;
+         }
+
+         return 1;
+      };
+
+      my $E    = $@;
+      my $time = time;
+
+      # Wrap any unexpected exceptions inside an Error::Simple.
+      $E = Error::Simple->new( "Unexpected error: $E", 0 ) unless ref($E) eq 'Error::Simple';
+
+      $Self->Send( [ $time, 'EXCN', $E ] );
+      $0 = "$Self->{'.CommandLine'} EXCN ($E->{'-text'}) \@ " . $time;
+
+   }
+   continue {
+
+      # Prevent excessive looping
+      sleep 5;
+   }
+}
+
+################################################################################################
+# Code for processing the config file
+
+#
+# Process a key=value pair
+#
+sub config_keyval {
+   my $K     = shift;
+   my $V     = shift;
+   my $Check = shift;
+
+   my $P = $NP_OPTIONS;
+   foreach ( split( /\./, $K ) ) {
+      do {
+         &Log("*ERROR OPTION '$K' DOES NOT EXIST");
+         return undef;
+      } unless exists $P->{$_};
+
+      if( ref( $P->{$_} ) eq 'HASH' ) {
+         $P = $P->{$_};
+      }
+      elsif ( ref( $P->{$_} ) ) {    # Non-HASH refs currently unsupported.
+         return undef;
+      }
+      else {
+         if( !$Check ) {
+            $P->{$_} = $V;
+         }
+         else {
+            &Log("*READ OPTION $K=$V");
+         }
+
+         return 1;
+
+      }
+   }
+}
+
+#
+# Parse config file and return a data structure representing the contents.
+#
+sub config_reparse {
+
+   open( CONF, "<", $_[0] ) || die "$0: Cannot open config file '$_[0]': $!";
+
+   my $VSs;
+   my $Hosts;
+
+   my $ServiceIPPs;
+   my $HostIPPs;
+   my $Options;
+
+   my $Line = 0;
+
+   my $R = eval {
+
+      while( local $_ = <CONF> ) {
+         $Line++;
+
+         chomp;
+         s!(\#|\;).*$!!s;    # Remove comments
+
+         next if /^\s*$/s;   # Skip blank lines
+
+         # Parse 'global option' lines of form:
+         # key=value
+         if(/^\s*([^=\s]+)=(.*)$/) {
+            $Options->{$1} = $2 if &config_keyval( $1, $2, 1 );
+            next;
+         }
+
+         # Parse 'virtual service' lines of form:
+         # Tag Host:Port[:DefaultRealServerPort] HTTP-Check-Path [Options]
+         if(/^!\s+([^\s]+)\s+([^:]+):(\d+)(?::(\d+))?\s+([^\s]+)(?:\s+([^\s]+))?/) {
+
+            my $STitle       = $1;
+            my $SHostOrIP    = $2;
+            my $SPort        = $3;
+            my $HPortDefault = $4;
+            my $Checker      = $5;
+            my $HOptions     = $6;
+
+            if( defined $VSs->{$STitle} ) {
+               &Log("*ERROR VS tag '$STitle' already defined at line $Line");
+               return undef;    # Prevent generating actions
+            }
+
+            my $SHost;
+            my $SIP;
+            if( $SHostOrIP =~ /^\d+\.\d+\.\d+\.\d+$/ ) {
+               $SHostOrIP =~ s/(^|\.)0+(\d)/$1$2/sg;    # Normalise the IP
+               $SIP = $SHostOrIP;
+               $SHost = &DNS_Lookup($SHostOrIP) || $SIP;
+            }
+            else {
+               $SHost = $SHostOrIP;
+               $SIP   = &DNS_Lookup($SHostOrIP);
+            }
+
+            unless( defined $SIP ) {
+               &Log("*ERROR Could not resolve IP address for '$SHost' in VS entry '$STitle' at line $Line");
+               return undef;                            # Prevent generating actions
+            }
+
+            if( defined $ServiceIPPs->{"$SIP:$SPort"} ) {
+               &Log( "*ERROR VS tag '$STitle' for host '$SHost' resolves with IP/Port $SIP:$SPort which duplicates that for VS tag '" . $ServiceIPPs->{"$SIP:$SPort"} . "' at line $Line" );
+               return undef;                            # Prevent generating actions
+            }
+
+            $ServiceIPPs->{"$SIP:$SPort"} = $STitle;
+
+            $VSs->{$STitle} = bless { 'Title'        => $STitle,
+                                      'Service'      => "$SHost:$SPort",
+                                      'Checker'      => $Checker ne '-' ? $Checker : '',
+                                      'Service_IP'   => $SIP,
+                                      'Service_Port' => $SPort,
+                                      'Host_Port_Default' => $HPortDefault || $SPort,
+                                      'Options' => bless {},
+                                      'IPVS::Man::Config::VS::Options'
+              },
+              'IPVS::Man::Config::VS';
+
+            # Parse VS options of the form:
+            # key1=val1,key2,key3=val3
+            foreach ( split( /\,/, $HOptions ) ) {
+               if(/^([^=]+)=(.*)$/) {
+                  $VSs->{$STitle}->{'Options'}->{ lc($1) } = $2;
+               }
+               else {
+                  $VSs->{$STitle}->{'Options'}->{ lc($_) } = 1;
+               }
+            }
+
+            next;
+         }
+
+         # Parse 'host' lines of form:
+         # Tag Host[:Port] <service tag1>=<weight1> <service tag2=weight2> ...
+         if(/^\s*([^\s]+)\s+([^\s:]+)(?::(\d+))?(?:\s+(.+))?/) {
+            my %VSWs = split( /[\s=]/, $4 );
+
+            my $Title    = $1;
+            my $HostOrIP = $2;
+            my $HostPort = $3;
+
+            if( defined $Hosts->{$Title} ) {
+               &Log("*ERROR VS tag '$Title' already defined at line $Line");
+               return undef;    # Prevent generating actions
+            }
+
+            my $Host;
+            my $IP;
+            if( $HostOrIP =~ /^\d+\.\d+\.\d+\.\d+$/ ) {
+               $HostOrIP =~ s/(^|\.)0+(\d)/$1$2/sg;    # Normalise the IP
+               $IP = $HostOrIP;
+               $Host = &DNS_Lookup($HostOrIP) || $IP;
+            }
+            else {
+               $Host = $HostOrIP;
+               $IP   = &DNS_Lookup($HostOrIP);
+            }
+
+            unless( defined $IP ) {
+               &Log("*ERROR Could not resolve an IP address for '$Host' in host entry '$Title' at line $Line");
+               return undef;                           # Prevent generating actions
+            }
+
+            if( defined $HostIPPs->{$IP} ) {
+               &Log( "*ERROR host tag '$Title' for host '$Host' resolves with IP $IP which duplicates that for host tag '" . $HostIPPs->{"$IP"} . "' at line $Line" );
+               return undef;                           # Prevent generating actions
+            }
+
+            $HostIPPs->{$IP} = $Title;
+
+            $Hosts->{$Title} = bless { 'Title' => $Title,
+                                       'Host'  => $Host,
+                                       'VSW'   => { map { $_ => { 'Weight' => $VSWs{$_} } } keys %VSWs },
+                                       'IP'    => $IP,
+                                       'Port'  => $HostPort
+              },
+              'IPVS::Man::Config::Host';
+
+            next;
+         }
+
+         # Fall-through. If we get here, we have a syntax error.
+         &Log("*ERROR in syntax of '$_' at line $Line");
+         return undef;    # Do not generate actions if the current line cannot be parsed
+
+      }
+
+      return 1;
+   };
+
+   close CONF;
+
+   return undef unless $R;
+
+   return { 'VSs' => $VSs, 'Hosts' => $Hosts, 'Options' => $Options };
+}
+
+#
+# Perform a structured diff of the old and new config file data structures,
+# and compile a data structure of actions to take to bring the new config
+# into effect.
+#
+# See config_reload_guts for details of $Live.
+#
+sub config_generate_actions {
+   my $File = shift;
+   my $Live = shift;
+
+   # Generate config structure from conf file
+   my $Config = &config_reparse($File);
+
+   return undef unless defined $Config;    # Do nothing if failed to load the config
+
+   my ( $NewVSs, $NewHosts, $NewOptions ) = @$Config{ 'VSs', 'Hosts', 'Options' };
+
+   my $Actions;
+
+   # Set any options found.
+   # Currently any old options no longer specified, retain their previous values!
+   while( my ( $K, $V ) = each %$NewOptions ) {
+      push( @$Actions, { 'Action' => 'SetOption', 'Key' => $K, 'Value' => $V } );
+   }
+
+   return $Actions if $Live < 2;
+
+   # Tampering with $GLOBAL is henceforth allowed.
+   my $OldVSs   = $GLOBAL->{'VSs'};
+   my $OldHosts = $GLOBAL->{'Hosts'};
+
+   # Now try and reconcile 'old' (pre-existing, current) data structures with new ones.
+
+   # Look through old hosts...
+   while( my ( $OldHost, $OldHostDS ) = each %$OldHosts ) {
+
+      if( keys %{ $OldHostDS->{'VSW'} } ) {
+
+         # Look through old host VSW...
+         foreach my $OldVS ( keys %{ $OldHostDS->{'VSW'} } ) {
+
+            next unless $OldVSs->{$OldVS};
+
+            # Check for old host's VS no longer present, old host's old VS Service != old host's new VS Service,
+            # old host no longer present, old host still present but no longer on this VS
+            if(    !exists $NewVSs->{$OldVS}
+                || $NewVSs->{$OldVS}->{'Service'} ne $OldVSs->{$OldVS}->{'Service'}
+                || !exists $NewHosts->{$OldHost}
+                || !exists $NewHosts->{$OldHost}->{'VSW'}->{$OldVS} ) {
+               push( @$Actions, { 'Action' => 'RemoveHostFromVS', 'VS' => $OldVS, 'Host' => $OldHostDS } );
+            }
+         }
+      }
+
+      if( !exists $NewHosts->{$OldHost} ) {
+         push( @$Actions, { 'Action' => 'RemoveHost', 'Host' => $OldHostDS } );
+      }
+
+   }
+
+   while( my ( $OldVS, $OldVSDS ) = each %$OldVSs ) {
+      if( !exists $NewVSs->{$OldVS} || $NewVSs->{$OldVS}->{'Service'} ne $OldVSs->{$OldVS}->{'Service'} ) {
+         push( @$Actions, { 'Action' => 'RemoveVS', 'VS' => $OldVSDS } );
+      }
+   }
+
+   while( my ( $NewVS, $NewVSDS ) = each %$NewVSs ) {
+
+      if( !exists $OldVSs->{$NewVS} || $OldVSs->{$NewVS}->{'Service'} ne $NewVSs->{$NewVS}->{'Service'} ) {
+         push( @$Actions, { 'Action' => 'AddVS', 'VS' => $NewVSDS } );
+      }
+      else {
+         if( $OldVSs->{$NewVS}->{'Checker'} ne $NewVSs->{$NewVS}->{'Checker'} ) {
+            push( @$Actions, { 'Action' => 'UpdateVSChecker', 'VS' => $NewVSDS, 'OldVS' => $OldVSs->{$NewVS} } );
+         }
+         if( $OldVSs->{$NewVS}->{'Options'}->serialise() ne $NewVSs->{$NewVS}->{'Options'}->serialise() ) {
+            push( @$Actions, { 'Action' => 'UpdateVSOptions', 'VS' => $NewVSDS } );
+         }
+      }
+   }
+
+   while( my ( $NewHost, $NewHostDS ) = each %$NewHosts ) {
+
+      if( !exists $OldHosts->{$NewHost} ) {
+         push( @$Actions, { 'Action' => 'AddHost', 'Host' => $NewHostDS } );
+      }
+
+      if( keys %{ $NewHostDS->{'VSW'} } ) {
+         foreach my $NewVS ( keys %{ $NewHostDS->{'VSW'} } ) {
+
+            if(    !exists $OldVSs->{$NewVS}
+                || $OldVSs->{$NewVS}->{'Service'} ne $NewVSs->{$NewVS}->{'Service'}
+                || !exists $OldHosts->{$NewHost}
+                || !exists $OldHosts->{$NewHost}->{'VSW'}->{$NewVS} ) {
+               push( @$Actions, { 'Action' => 'AddHostToVS', 'VS' => $NewVS, 'Host' => $NewHostDS } );
+            }
+            elsif ( exists $OldHosts->{$NewHost}
+                    && $OldHosts->{$NewHost}->{'VSW'}->{$NewVS}->{'Weight'} != $NewHostDS->{'VSW'}->{$NewVS}->{'Weight'} ) {
+               push( @$Actions, { 'Action' => 'ChangeWeight', 'VS' => $NewVS, 'Host' => $NewHostDS } );
+            }
+         }
+      }
+
+   }
+
+   return $Actions;
+}
+
+#
+# Main guts of the config processing code.
+#
+# Call back to parse config file, perform diff, and generate actions; then process the actions
+# to implement the new config.
+#
+# $Live == 0: return the actions structure;
+# $Live == 1: process only options from the actions structure; DO NOT TAMPER WITH $GLOBAL;
+#             used at script initialisation time to load initial variables.
+# $Live == 2: process options, as well as the actions structure.
+#
+sub config_reload_guts {
+   my $Live = shift;
+
+   my $Actions = &config_generate_actions( $NP_OPTIONS->{'Config'}->{'Path'}, $Live );
+   return $Actions unless $Actions && $Live;
+
+   foreach my $A (@$Actions) {
+
+      if( $A->{'Action'} eq 'SetOption' ) {
+         config_keyval( $A->{'Key'}, $A->{'Value'} );
+         next;
+      }
+   }
+
+   return if $Live < 2;
+
+   # Tampering with $GLOBAL is henceforth allowed.
+   my $File = $NP_OPTIONS->{'Config'}->{'Path'};
+   my $s    = stat $File;
+   $GLOBAL->{'Config'}->{'MTime'} = $s->mtime;
+
+   my $Hosts = $GLOBAL->{'Hosts'};
+   my $VSs   = $GLOBAL->{'VSs'};
+   my $NP    = $NP_GLOBAL->{'HostCheckers'};
+
+   foreach my $A (@$Actions) {
+
+      my $A_VS = $A->{'VS'};
+
+      if( $A->{'Action'} eq 'AddVS' ) {
+         &Log("Adding VS '$A_VS->{'Title'}'");
+         $VSs->{ $A_VS->{'Title'} } = $A_VS;
+         &IPVS_Add_VServer($A_VS);
+         next;
+      }
+
+      if( $A->{'Action'} eq 'RemoveVS' ) {
+         &Log("Removing VS '$A_VS->{'Title'}'");
+         &IPVS_Remove_VServer($A_VS);
+         delete $VSs->{ $A_VS->{'Title'} };
+
+         # foreach my $Host (values %$Hosts) {
+         #     delete $Host->{'VSW'}->{ $A_VS };
+         # }
+
+         next;
+      }
+
+      if( $A->{'Action'} eq 'UpdateVSOptions' ) {
+         $VSs->{ $A_VS->{'Title'} }->{'Options'} = $A_VS->{'Options'};
+      }
+
+      if( $A->{'Action'} eq 'UpdateVSChecker' ) {
+         my $OldChecker = $A->{'OldVS'}->{'Checker'};
+         &Log("Updating VS Checker from '$OldChecker' to '$A_VS->{'Checker'}'");
+
+         foreach my $Host ( keys %$NP ) {
+
+            # Shut down any checkers that are related to no remaining VSs.
+            if( my $Checker = $NP->{$Host}->{$OldChecker} ) {
+
+               if( exists $Checker->{'VSs'} && exists $Checker->{'VSs'}->{ $A_VS->{'Title'} } ) {
+                  delete $Checker->{'VSs'}->{ $A_VS->{'Title'} };
+                  if( !keys %{ $Checker->{'VSs'} } ) {
+                     next unless $Checker->{'Child'};
+
+                     &Log("Shutting down VS/Host/Checker '$A_VS->{'Title'}/$Host/$OldChecker'");
+                     $Checker->{'Child'}->Terminate;
+                     delete $Checker->{'Child'};
+                  }
+               }
+            }
+
+            # Remove Checker status from the Global persistent hash.
+            delete $Hosts->{$Host}->{'Checkers'}->{$OldChecker};
+         }
+
+         # Update the VS
+         $VSs->{ $A_VS->{'Title'} }->{'Checker'} = $A_VS->{'Checker'};
+
+         # Start any new checkers.
+         my $VS = $VSs->{ $A_VS->{'Title'} };
+         foreach my $Host ( values %$Hosts ) {
+
+            # Skip through to find Hosts which are linked to this VS.
+            next unless $Host->{'VSW'}->{ $VS->{'Title'} };
+
+            &Log("Starting up VS/Host/Checker '$VS->{'Title'}/$Host->{'Title'}/$VS->{'Checker'}'");
+
+            $NP->{ $Host->{'Title'} }->{ $VS->{'Checker'} }->{'Child'} =
+              $CheckerTemplate->spawn( { '.Title' => $Host->{'Title'}, '.CommandLine' => "$0 $Host->{'Title'} ($Host->{'IP'}) $VS->{'Checker'}" },
+                                       { 'Title' => $Host->{'Title'}, 'IP' => $Host->{'IP'}, 'Host' => $Host->{'Host'}, 'Path' => $VS->{'Checker'}, 'VS' => $VS->{'Title'} } )
+              unless keys %{ $NP->{ $Host->{'Title'} }->{ $VS->{'Checker'} }->{'VSs'} };
+
+            $NP->{ $Host->{'Title'} }->{ $VS->{'Checker'} }->{'VSs'}->{ $VS->{'Title'} } = 1;
+         }
+
+         next;
+      }
+
+      my $Host = $A->{'Host'};
+
+      if( $A->{'Action'} eq 'AddHost' ) {
+         $Hosts->{ $Host->{'Title'} } = $Host unless defined $Hosts->{ $Host->{'Title'} };
+         foreach (qw( Host IP Port Title )) { $Hosts->{ $Host->{'Title'} }->{$_} = $Host->{$_}; }
+         &Log("Adding Host '$Host->{'Title'}'");
+         next;
+      }
+
+      if( $A->{'Action'} eq 'RemoveHost' ) {
+         delete $Hosts->{ $Host->{'Title'} };
+         &Log("Removing Host '$Host->{'Title'}'");
+         next;
+      }
+
+      my $VS = $VSs->{ $A->{'VS'} };
+
+      if( $A->{'Action'} eq 'AddHostToVS' ) {
+
+         if( !$VSs->{ $A->{'VS'} } ) {
+            &Log("Ignoring action to add host '$Host->{'Title'}' to VS '$A->{'VS'}' that doesn't exist!");
+            next;
+         }
+
+         &Log("Adding Host '$Host->{'Title'}' to VS '$A->{'VS'}' with Checker '$VS->{'Checker'}'");
+
+         $Hosts->{ $Host->{'Title'} } = $Host unless defined $Hosts->{ $Host->{'Title'} };
+         foreach (qw( Host IP Port Title )) { $Hosts->{ $Host->{'Title'} }->{$_} = $Host->{$_}; }
+
+         $Hosts->{ $Host->{'Title'} }->{'VSW'}->{ $A->{'VS'} }->{'Weight'} = $Host->{'VSW'}->{ $A->{'VS'} }->{'Weight'};
+
+         if( $VS->{'Checker'} ) {
+            &Log("Starting up VS/Host/Checker '$VS->{'Title'}/$Host->{'Title'}/$VS->{'Checker'}'");
+
+            $NP->{ $Host->{'Title'} }->{ $VS->{'Checker'} }->{'Child'} =
+              $CheckerTemplate->spawn( { '.Title' => $Host->{'Title'}, '.CommandLine' => "$0 $Host->{'Title'} ($Host->{'IP'}) $VS->{'Checker'}" },
+                                       { 'Title' => $Host->{'Title'}, 'IP' => $Host->{'IP'}, 'Host' => $Host->{'Host'}, 'Path' => $VS->{'Checker'}, 'VS' => $VS->{'Title'} } )
+              unless keys %{ $NP->{ $Host->{'Title'} }->{ $VS->{'Checker'} }->{'VSs'} };
+
+            $NP->{ $Host->{'Title'} }->{ $VS->{'Checker'} }->{'VSs'}->{ $VS->{'Title'} } = 1;
+         }
+
+         &IPVS_Add_RealServer( $VSs->{ $A->{'VS'} }, $Hosts->{ $Host->{'Title'} } );
+         next;
+      }
+
+      if( $A->{'Action'} eq 'RemoveHostFromVS' ) {
+
+         if( !$VSs->{ $A->{'VS'} } ) {
+            &Log("Ignoring action to remove host '$Host->{'Title'}' from VS '$A->{'VS'}' that doesn't exist!");
+            next;
+         }
+
+         &Log("Removing Host '$Host->{'Title'}' from VS '$A->{'VS'}' with Checker '$VS->{'Checker'}'");
+
+         if( my $Checker = $NP->{ $Host->{'Title'} }->{ $VS->{'Checker'} } ) {
+
+            if( exists $Checker->{'VSs'} && exists $Checker->{'VSs'}->{ $VS->{'Title'} } ) {
+               delete $Checker->{'VSs'}->{ $VS->{'Title'} };
+               if( !keys %{ $Checker->{'VSs'} } ) {
+                  next unless $Checker->{'Child'};
+
+                  &Log("Shutting down VS/Host/Checker '$VS->{'Title'}/$Host->{'Title'}/$VS->{'Checker'}'");
+                  $Checker->{'Child'}->Terminate;
+                  delete $Checker->{'Child'};
+               }
+            }
+
+         }
+
+         &IPVS_Remove_RealServer( $VSs->{ $A->{'VS'} }, $Hosts->{ $Host->{'Title'} } );
+         delete $Hosts->{ $Host->{'Title'} }->{'VSW'}->{ $A->{'VS'} };
+         next;
+
+      }
+
+      if( $A->{'Action'} eq 'ChangeWeight' ) {
+
+         if( !$VSs->{ $A->{'VS'} } ) {
+            &Log("Ignoring action to change weight on host '$Host->{'Title'}' for VS '$A->{'VS'}' that doesn't exist!");
+            next;
+         }
+
+         &Log("Changing weight on host '$Host->{'Title'}' for VS '$A->{'VS'}' from '$Hosts->{ $Host->{'Title'} }->{'VSW'}->{ $A->{'VS'} }->{'Weight'}' to '$Host->{'VSW'}->{ $A->{'VS'} }->{'Weight'}'");
+         $Hosts->{ $Host->{'Title'} }->{'VSW'}->{ $A->{'VS'} }->{'Weight'} = $Host->{'VSW'}->{ $A->{'VS'} }->{'Weight'};
+         &IPVS_Update_RealServer( $VSs->{ $A->{'VS'} }, $Hosts->{ $Host->{'Title'} } );
+         next;
+
+      }
+   }
+
+   # Add sorry servers on any VSs that have no active hosts
+   &IPVS_Update_VSs();
+
+}
+
+#
+# Wrapper for config file processing, that ensures the persistent DB file
+# will be synced once it returns.
+#
+sub config_reload {
+   &config_reload_guts( $_[0] );
+
+   ( tied $GLOBAL )->sync() if defined( tied $GLOBAL );
+}
+
+#
+# Check if config file has updated
+#
+sub config_has_updated {
+
+   return undef unless( time - $GLOBAL->{'Config'}->{'CheckTime'} ) > $NP_OPTIONS->{'Config'}->{'CheckPeriod'};
+
+   my $File = $NP_OPTIONS->{'Config'}->{'Path'};
+
+   $GLOBAL->{'Config'}->{'CheckTime'} = time;
+
+   my $s = stat $File;
+
+   return undef unless $s->mtime > $GLOBAL->{'Config'}->{'MTime'};
+
+   &Log( sprintf( "Config file updated (mtime %s > last mtime %s)", $s->mtime, $GLOBAL->{'Config'}->{'MTime'} ) );
+
+   return 1;
+}
+
+#
+# Reload config if file has updated.
+#
+# See config_reload_guts for details of $Live.
+#
+sub config_check {
+   my $Live = shift;
+
+   return undef unless &config_has_updated();
+
+   config_reload($Live);
+}
+
+################################################################################################
+# Code for restarting Checkers, on script restart
+
+sub monitors_restart {
+   my $NP = $NP_GLOBAL->{'HostCheckers'};
+
+   while( my ( $Host_Title, $Host ) = each %{ $GLOBAL->{'Hosts'} } ) {
+
+      foreach my $VS_Title ( keys %{ $Host->{'VSW'} } ) {
+
+         my $VS = $GLOBAL->{'VSs'}->{$VS_Title};
+
+         if( $VS->{'Checker'} ) {
+
+            $NP->{ $Host->{'Title'} }->{ $VS->{'Checker'} }->{'Child'} =
+              $CheckerTemplate->spawn( { '.Title' => $Host->{'Title'}, '.CommandLine' => "$0 $Host->{'Title'} ($Host->{'IP'}) $VS->{'Checker'}" },
+                                       { 'Title' => $Host->{'Title'}, 'IP' => $Host->{'IP'}, 'Host' => $Host->{'Host'}, 'Path' => $VS->{'Checker'}, 'VS' => $VS->{'Title'} } )
+              unless keys %{ $NP->{ $Host->{'Title'} }->{ $VS->{'Checker'} }->{'VSs'} };
+
+            $NP->{ $Host->{'Title'} }->{ $VS->{'Checker'} }->{'VSs'}->{ $VS->{'Title'} } = 1;
+         }
+      }
+   }
+}
+
+################################################################################################
+# Event handler
+
+sub OnEvent {
+   my $thing = shift;
+
+   my $HOSTS = $GLOBAL->{'Hosts'};
+   my $VSS   = $GLOBAL->{'VSs'};
+
+   # Handle Checker events
+   if( $thing->isa('Xebedii::Pollable::Child') ) {
+
+      if( $thing->Exited ) {
+         my $PID = $thing->PID;
+         my $EC  = $thing->ExitCode;
+         &Log( sprintf( "Reaping exiting child, PID '%s', Host '%s', IP '%s', VS '%s', Path '%s', (Title '%s', PID '%d', Exited '%d', TimedOut '%d') exited with code '%d'",
+                        $PID,
+                        $thing->{'.Args'}->{'Host'},
+                        $thing->{'.Args'}->{'IP'},
+                        $thing->{'.Args'}->{'VS'},
+                        $thing->{'.Args'}->{'Path'},
+                        $thing->{'.Title'}, $thing->{'.Exited'}, $thing->TimedOut, $EC
+               )
+         );
+
+         $thing->destroy;
+
+         # Only respawn here if kid needs to be respawned i.e. if it died in error, not because the monitor is no longer needed.
+         unless( $thing->Terminating ) {
+            &Log("Respawning '$thing->{'.Args'}->{'Title'}/$thing->{'.Args'}->{'Host'}/$thing->{'.Args'}->{'Path'}'");
+            $thing->spawn( { '.CommandLine' => $thing->{'.CommandLine'} . ' RESPAWN' } )
+              if keys %{ $NP_GLOBAL->{'HostCheckers'}->{ $thing->{'.Args'}->{'Title'} }->{ $thing->{'.Args'}->{'Path'} }->{'VSs'} };
+         }
+      }
+
+      if( defined $thing->Received ) {
+
+         my $Msg = $thing->Received;
+         $thing->ReceivedReset;
+
+         my $ResponseTime = $Msg->[0];
+         my $ResponseCode = $Msg->[1];
+         my $ResponseData = $Msg->[2];
+
+         my $Status = $ResponseCode . ( $HOSTS->{ $thing->Title }->{'Disabled'} ? '/DISABLED' : '' );
+
+         my $ResponseText;
+
+         if( ref $ResponseData eq 'HASH' && exists $ResponseData->{'Code'} ) {
+            if( $GLOBAL->{'Log'}->{'Level'} >= 5 ) {
+               $ResponseText = $ResponseData->{'Code'} . '|' . $ResponseData->{'Msg'};
+               my $Body = $ResponseData->{'Body'};
+               $Body =~ s/\n/<LF>/sg;
+               $ResponseText .= '|' . $Body;
+            }
+         }
+         elsif ( ref $ResponseData eq 'Error::Simple' ) {
+            $ResponseText = "Exception: '$ResponseData->{'-text'}'";
+         }
+         else {
+            $ResponseText = "BUG: " . &Dumper($ResponseData);
+         }
+
+         $ResponseText = $Status . ( $ResponseText && ( ' (' . $ResponseText . ')' ) );
+
+         &Log( sprintf "Received from checker '%s/%s' (PID %d): %s", $thing->{'.Title'}, $thing->{'.Args'}->{'Path'}, $thing->{'.PID'}, $ResponseText )
+           if $GLOBAL->{'Log'}->{'Level'} >= 6
+              || ( $GLOBAL->{'Log'}->{'Level'} >= 5 && $HOSTS->{ $thing->Title }->{'Checkers'}->{ $thing->{'.Args'}->{'Path'} }->{'Status'} ne $Status );
+
+         $HOSTS->{ $thing->Title }->{'Checkers'}->{ $thing->{'.Args'}->{'Path'} }->{'Status'}     = $Status;
+         $HOSTS->{ $thing->Title }->{'Checkers'}->{ $thing->{'.Args'}->{'Path'} }->{'LastUpdate'} = $ResponseTime;
+
+         &IPVS_Update_RealServers( $HOSTS->{ $thing->Title } );
+
+         # (tied $GLOBAL)->sync();
+      }
+
+      return;
+   }
+
+   # Handle management console connection event
+   if( $thing->isa('Xebedii::Pollable::Socket::TCP') && $thing->Type eq 'TCP::Listening' ) {
+      $thing->Accepted()->Send( $HELP . "\n" );
+      $thing->Reset();
+      return;
+   }
+
+   # Handle management console or FIFO input event
+   if( $thing->isa('Xebedii::Pollable::File') || $thing->isa('Xebedii::Pollable::Socket::TCP') ) {
+
+      if( defined $thing->Received ) {
+
+         my $Msg = $thing->Received;
+         $thing->ReceivedReset;
+
+         $Msg =~ s/^\s+//sg;
+         $Msg =~ s/\s+$//sg;
+         $Msg =~ s/\s+/ /sg;
+
+         &Log( sprintf "Title '%s', Msg '%s'", $thing->{'.Title'}, $Msg );
+
+         my $OutFn =
+           $thing->isa('Xebedii::Pollable::File')
+           ? \&Log
+           : sub {
+            $thing->Send( $_[0] );    # . ($_[1] ? '' : "\n"));
+           };
+
+         our @MSG_HISTORY;
+         if( $Msg =~ /^\!$/ ) {
+            $Msg = $MSG_HISTORY[0];
+         }
+         elsif ( $Msg =~ /^show\s+/i ) {
+            unshift( @MSG_HISTORY, $Msg );
+            splice( @MSG_HISTORY, 20 );
+         }
+
+         if( $Msg =~ /^(h|help|\?)$/i ) {
+            &$OutFn( $HELP . "\n" );
+         }
+         elsif ( $Msg =~ /^history$/i ) {
+            &$OutFn( join( '', map { ">> $_\n" } @MSG_HISTORY ) );
+         }
+         elsif ( $Msg =~ /^config\s+reload$/i ) {
+            &config_reload(2);
+         }
+         elsif ( $Msg =~ /^config\s+diff$/i ) {
+            &$OutFn( &Dumper( &config_reload(0) ) . "\n" );
+         }
+         elsif ( $Msg =~ /^dump\s+status$/i ) {
+            &$OutFn( "Status: " . &Dumper($GLOBAL) . "\n" );
+         }
+         elsif ( $Msg =~ /^dump\s+(config\s+)?options$/i ) {
+            &$OutFn( "Config options: " . &Dumper($NP_OPTIONS) . "\n" );
+         }
+         elsif ( $Msg =~ /^dump\s+checkers$/i ) {
+            &$OutFn( "Status: " . &Dumper( $NP_GLOBAL->{'HostCheckers'} ) . "\n" );
+         }
+         elsif ( $Msg =~ /^dump\s+hosts?(?:\s+([\w\-]+))?$/i ) {
+            my $H = $1;
+            if($H) {
+               if( $HOSTS->{$H} ) {
+                  &$OutFn( "Host '$H': " . &Dumper( $HOSTS->{$H} ) . "\n" );
+               }
+               else {
+                  &$OutFn("# Host '$H': Not found\n");
+               }
+            }
+            else {
+               &$OutFn( "Hosts: " . &Dumper($HOSTS) . "\n" );
+            }
+         }
+         elsif ( $Msg =~ /^dump\s+hosts?$/i ) {
+            &$OutFn( "GLOBAL: " . &Dumper($HOSTS) . "\n" );
+         }
+         elsif ( $Msg =~ /^dump\s+vss?(?:\s+([\w\-]+))?$/i ) {
+            my $VS = $1;
+            if($VS) {
+               if( $VSS->{$VS} ) {
+                  &$OutFn( "VS '$VS': " . &Dumper( $VSS->{$VS} ) . "\n" );
+               }
+               else {
+                  &$OutFn("# VS '$VS': Not found\n");
+               }
+            }
+            else {
+               &$OutFn( "VSs: " . &Dumper($VSS) . "\n" );
+            }
+         }
+
+         # set host H off
+         elsif ( $Msg =~ /^set\s+host\s+([\w\-]+)\s+off$/i ) {
+            if( exists $HOSTS->{$1} ) {
+               $HOSTS->{$1}->{'Disabled'} = 1;
+
+               # (tied $GLOBAL)->sync();
+            }
+            else { &$OutFn("# Host '$1': Not found\n"); }
+            &IPVS_Update_RealServers( $HOSTS->{$1} );
+         }
+
+         # Turn on host H optionally in Z seconds
+         # set host H on [in Z]
+         elsif ( $Msg =~ /^set\s+host\s+([\w\-]+)\s+on(?:\s+(?:in\s+)?(\d+)s?)?$/i ) {
+            if( exists $HOSTS->{$1} ) {
+               if( $HOSTS->{$1}->{'Disabled'} ) {
+                  delete $HOSTS->{$1}->{'Disabled'};
+                  $HOSTS->{$1}->{'LastEnabled'} = time;
+                  $HOSTS->{$1}->{'WeightRampDuration'} = $2 if defined($2) && ( $2 > 0 );
+
+                  # (tied $GLOBAL)->sync();
+               }
+               else { &$OutFn("# Host '$1': Not found\n"); }
+            }
+            &IPVS_Update_RealServers( $HOSTS->{$1} );
+         }
+
+         # Turn off host H for VS A,B,C; optionally for reasons R
+         # set host H off for vs A,B,C [for | reasons | for reasons] R1,R2,R3
+         elsif ( $Msg =~ /^set\s+host\s+([\w\-]+)\s+off\s+(?:on\s+|for\s+|in\s+)?vs\s+([\w\-\,]+)(?:\s+(?:for|reasons?|for\s+reasons?)\s+([\w\-\,]+))?$/i ) {
+            if( exists $HOSTS->{$1} ) {
+               foreach my $VS ( split( /\,/, $2 ) ) {
+                  if( exists $HOSTS->{$1}->{'VSW'}->{$VS} ) {
+                     my $Reasons = $3 || 'default';
+                     foreach my $R ( split( /,/, $Reasons ) ) {
+                        $HOSTS->{$1}->{'VSW'}->{$VS}->{'Disabled'}->{$R} = 1;
+                     }
+
+                     delete $HOSTS->{$1}->{'VSW'}->{$VS}->{'WeightRampDuration'};
+                     delete $HOSTS->{$1}->{'VSW'}->{$VS}->{'WeightRampDeadline'};
+
+                     # (tied $GLOBAL)->sync();
+                  }
+                  else { &$OutFn("# Host '$1' in VS '$VS': Not found\n"); }
+               }
+            }
+            else { &$OutFn("# Host '$1': Not found\n"); }
+
+            &IPVS_Update_RealServers( $HOSTS->{$1} );
+         }
+
+         # Turn on host X for VS Y, optionally for reasons R, optionally in Z seconds
+         # set host H on for vs V1,V2,V3 for reasons R1,R2,R3
+         elsif ( $Msg =~ /^set\s+host\s+([\w\-]+)\s+on\s+(?:on\s+|for\s+|in\s+)?vs\s+([\w\-\,]+)(?:\s+(?:for|reasons?|for\s+reasons?)\s+([\w\-\,]+|\*))?(?:\s+(?:in\s+)?(\d+)s?)?$/i ) {
+            my $Host    = $1;
+            my $VSs     = $2;
+            my $Reasons = $3 || 'default';
+            my $WRD     = $4;
+
+            if( exists $HOSTS->{$Host} ) {
+               foreach my $VS ( split( /\,/, $VSs ) ) {
+                  if( exists $HOSTS->{$Host}->{'VSW'}->{$VS} ) {
+                     my $vs = $HOSTS->{$Host}->{'VSW'}->{$VS};
+
+                     # Skip this $VS if it is not actually disabled, i.e. already enabled.
+                     next unless exists $vs->{'Disabled'} && keys %{ $vs->{'Disabled'} };
+
+                     # To get here, this Host/VS must be genuinely disabled.
+
+                     foreach my $R ( split( /,/, $Reasons ) ) {
+                        if( exists $vs->{'Disabled'}->{$R} ) {
+                           delete $vs->{'Disabled'}->{$R};
+                        }
+                     }
+
+                     if( $Reasons eq '*' || !( exists $vs->{'Disabled'} ) || !( keys %{ $vs->{'Disabled'} } ) ) {
+                        delete $vs->{'Disabled'};    # In case $Reasons eq '*', or $vs->{'Disabled'} is {}
+                        $vs->{'LastEnabled'} = time;
+                        $vs->{'WeightRampDuration'} = $WRD if defined($WRD) && ( $WRD > 0 );
+                     }
+
+                     # (tied $GLOBAL)->sync();
+                  }
+                  else { &$OutFn("# Host '$Host' in VS '$VS': Not found\n"); }
+               }
+            }
+            else { &$OutFn("# Host '$Host': Not found\n"); }
+
+            &IPVS_Update_RealServers( $HOSTS->{$Host} );
+         }
+
+         # show hosts h1,h2,h3 in vs1,vs2,vs3
+         elsif ( $Msg =~ /^show\s+hosts?\s+([\w\-\,]+)(?:\s+(?:for|in)\s+([\w\-\,]+))?$/i ) {
+            my $Hs  = $1;
+            my $VSs = $2;
+
+            my @VSs;
+            foreach my $VS ( sort split( /[\s\,]/, $VSs ) ) {
+               if( exists $VSS->{$VS} ) { push( @VSs, $VS ); next; }
+               &$OutFn("# VS '$VS': not found\n");
+            }
+
+            my $tm = time;
+
+            foreach my $H ( split( /\s*,\s*/, $Hs ) ) {
+
+               if( !exists $HOSTS->{$H} ) {
+                  &$OutFn("# Host '$H': not found\n");
+                  next;
+               }
+
+               my $Host = $HOSTS->{$H};
+
+               &IPVS_Update_RealServers($Host);
+
+               my $T = &IPVS_Parse();
+
+               my $ActiveConn = 0;
+               my $Weight     = 0;
+               my $Disabled   = 0;
+               my $TStatus;
+               my @TStatus;
+
+               @VSs = sort keys %{ $Host->{'VSW'} } unless $VSs;
+               $VSs = join( ',', @VSs );
+
+               # Construct a 'TMinus' string indicating the time(s) before ramping is complete on the specified VSs, or '0' if the host has final weight on all VSs.
+               foreach my $VS (@VSs) {
+                  next unless exists $Host->{'VSW'}->{$VS};
+
+                  my $HostSVC = $Host->{'VSW'}->{$VS};
+
+                  my $TStatus = $HostSVC->{'TStatus'};
+                  $TStatus .= '-' . int( $HostSVC->{'TMinus'} ) if $TStatus eq '1-RAMPING';
+                  push( @TStatus, $TStatus );
+               }
+
+               $TStatus = scalar( grep { /^1-/ } @TStatus ) ? join( ',', @TStatus ) : '0-DONE';
+
+               foreach my $VS (@VSs) {
+                  next unless exists $VSS->{$VS};
+
+                  my $SVC   = $VSS->{$VS};
+                  my $VS_HP = "$SVC->{'Service_IP'}:$SVC->{'Service_Port'}";
+
+                  # FIXME: If these port numbers and IPs have leading zeros that are not present in the IPVS_Parse output, or vice versa, we won't get a match!
+                  # Need to standardise on the format.
+                  my $RS_HP = "$Host->{'IP'}:" . ( $Host->{'Port'} || $SVC->{'Host_Port_Default'} );
+
+                  my $Status;
+                  if( exists( $Host->{'VSW'}->{$VS} ) ) {
+                     my $HostSVC = $Host->{'VSW'}->{$VS};
+
+                     $ActiveConn += $T->{$VS_HP}->{$RS_HP}->{'ActiveConn'};
+                     $Weight     += $T->{$VS_HP}->{$RS_HP}->{'Weight'};
+                     $Status = sprintf( "RS_HP=$RS_HP Disabled=%d Reasons=\"%s\" Weight=%d State.Weight=%d State.DesiredWeight=%d Proc.Weight=%d Proc.ActiveConn=%d",
+                                        exists( $HostSVC->{'Disabled'} ) && ( keys %{ $HostSVC->{'Disabled'} } ) ? 1 : 0,
+                                        exists( $HostSVC->{'Disabled'} ) ? join( ',', sort { $a cmp $b } keys %{ $HostSVC->{'Disabled'} } ) : '',
+                                        $HostSVC->{'Weight'},
+                                        $HostSVC->{'State'}->{'Weight'},
+                                        $HostSVC->{'State'}->{'DesiredWeight'},
+                                        $T->{$VS_HP}->{$RS_HP}->{'Weight'},
+                                        $T->{$VS_HP}->{$RS_HP}->{'ActiveConn'} );
+
+                     if( $HostSVC->{'WeightRampDuration'} ) {
+                        $Status .= " WR.Duration=$HostSVC->{'WeightRampDuration'}s";
+                     }
+                     if( my $WRD = $HostSVC->{'WeightRampDeadline'} ) {
+                        $Status .= sprintf( " WR.Deadline=%d WR.TMinus=%d", $WRD, $HostSVC->{'TMinus'} );
+                     }
+                     $Status .= " TStatus=$HostSVC->{'TStatus'}";
+                  }
+                  else { $Status = "N/A"; }
+
+                  &$OutFn("$H ($RS_HP) in $VS ($VS_HP): $Status\n");
+               }
+
+               &$OutFn( sprintf( "%s in (%s) Total.ActiveConn=%s Total.Weight=%s Combined.TStatus=%s\n", $H, $VSs, $ActiveConn, $Weight, $TStatus ) );
+
+            }
+         }
+
+         # show hosts
+         elsif ( $Msg =~ /^show\s+hosts$/i ) {
+            &$OutFn( join( ' ', sort keys %{$HOSTS} ) . "\n" );
+         }
+
+         # show vs
+         elsif ( $Msg =~ /^show\s+vss?$/i ) {
+            &$OutFn( join( ' ', sort keys %{$VSS} ) . "\n" );
+         }
+
+         # show hosts for vs1,vs2,vs3,...
+         elsif ( $Msg =~ /^show\s+hosts\s+for\s+([\w\-\s\,]+)$/i ) {
+            my $VSs = $1;
+
+            my @VSs;
+            foreach my $VS ( split( /[\s\,]/, $VSs ) ) {
+               if( exists $VSS->{$VS} ) { push( @VSs, $VS ); next; }
+               &$OutFn("# VS '$VS': not found\n");
+            }
+
+            my %Hosts;
+            foreach my $Host ( sort keys %{$HOSTS} ) {
+               foreach my $VS (@VSs) {
+                  $Hosts{$Host}++ if exists $HOSTS->{$Host}->{'VSW'}->{$VS};
+               }
+            }
+            &$OutFn( join( ' ', sort keys %Hosts ) . "\n" );
+         }
+
+         # log level <n>
+         elsif ( $Msg =~ /^log\s+level\s+(\d+)$/i ) {
+            $GLOBAL->{'Log'}->{'Level'} = $1;
+
+            # (tied $GLOBAL)->sync();
+            &$OutFn("Log Level set to '$1'\n");
+         }
+         elsif ( $Msg =~ /^(q(uit)?|exit|\x04)$/i ) {
+            $thing->destroy;
+            return;
+         }
+         elsif ( $Msg =~ /^$/ ) {
+         }
+         else {
+            &$OutFn("???\n");
+         }
+
+         &$OutFn('$ ');
+      }
+      elsif ( $thing->Exited ) {
+         &Log( "Item " . $thing->UID . ": Exited" );
+         $thing->destroy;
+      }
+
+      return;
+   }
+
+}
+
+################################################################################################
+# Main event loop
+
+sub PollChildren {
+   while( my @S = Xebedii::Pollable->_pollable ) {
+
+      my $thing = Xebedii::Pollable->_poll(1.0);
+
+      if($thing) {
+         &OnEvent($thing);
+      }
+      else {
+
+         # Loop through VS/Host permutations, and run Update_RealServer for each
+         # permutation that is ramping.
+         # Current implementation is a bit wasteful of CPU cycles, since by looping
+         # through hosts first, then VSs for each host, we end up calling IPVS_Update_VS
+         # multiple times for each VS.
+         foreach my $H ( sort keys %{ $GLOBAL->{'Hosts'} } ) {
+            &IPVS_Update_RealServers( $GLOBAL->{'Hosts'}->{$H} );
+         }
+      }
+   }
+   continue {
+      &config_check(2) if $NP_OPTIONS->{'Config'}->{'AutoCheck'};
+   }
+
+   return 1;
+}
+
+################################################################################################
+# Startup code.
+
+if( $CLOpts->{'dump'} ) {
+   &Log("Starting and loading config: PID=$$");
+
+   # Load Options
+   &config_reload(1);
+
+   &Log("Opening tied database '$NP_OPTIONS->{'DB'}'");
+
+   my $Tie = tie( $GLOBAL, 'Tie::Persistent', $NP_OPTIONS->{'DB'}, 'r' ) || &Log("Cannot open '$NP_OPTIONS->{'DB'}' because '$!'");
+   ( tied $GLOBAL )->autosync(0);
+
+   $Data::Dumper::Sortkeys = 1;
+   print &Dumper($GLOBAL), "\n";
+   exit(0);
+}
+
+unless( $CLOpts->{'nofork'} ) {
+   if(fork) {
+      exit;
+   }
+
+   # If we've forked, prevent standard I/O
+   close STDOUT;
+   close STDERR;
+   close STDIN;
+}
+
+&Log("Starting and loading config: PID=$$");
+
+# Load Options
+&config_reload(1);
+
+&Log("Creating management socket");
+
+my $S = Xebedii::Pollable::Socket::TCP->new( 'LocalAddr' => $NP_OPTIONS->{'Management'}->{'Socket'}->{'IP'},
+                                             'LocalPort' => $NP_OPTIONS->{'Management'}->{'Socket'}->{'Port'},
+                                             '.I/O'      => 'Char',
+                                             '.Title'    => 'Management Console'
+);
+
+# Use this as an applock (to prevent multiple main processes being launched).
+unless(
+   eval {
+      $S->listen();
+      return 1;
+   }
+  ) {
+   &Log("Exiting, since management socket already occupied");
+   exit(-1);
+}
+
+&Log("Opened management socket on '$NP_OPTIONS->{'Management'}->{'Socket'}->{'IP'}:$NP_OPTIONS->{'Management'}->{'Socket'}->{'Port'}'");
+
+&Log("Opening tied database '$NP_OPTIONS->{'DB'}'");
+
+my $Tie = tie( $GLOBAL, 'Tie::Persistent', $NP_OPTIONS->{'DB'}, 'rw' ) || &Log("Cannot open '$NP_OPTIONS->{'DB'}' because '$!'");
+( tied $GLOBAL )->autosync(0);
+
+$GLOBAL->{'Hosts'}          = {} unless $GLOBAL->{'Hosts'};
+$GLOBAL->{'VSs'}            = {} unless $GLOBAL->{'VSs'};
+$GLOBAL->{'Log'}->{'Level'} = 1  unless exists $GLOBAL->{'Log'}->{'Level'};
+
+# Process VSs and Hosts, and reprocess Options
+&config_reload(2);
+
+&Log("Restarting monitors");
+&monitors_restart();
+
+&Log("Opening pollable fifo on '$NP_OPTIONS->{'Management'}->{'Fifo'}->{'Path'}'");
+
+my $F = Xebedii::Pollable::File->new( '.I/O'   => 'Line',
+                                      '.Path'  => '/tmp/fifo',
+                                      '.Title' => 'MyFifo'
+);
+
+$F->open();
+
+&Log("Entering main event loop...");
+
+while(1) {
+   if( eval { return &PollChildren(); } ) {
+      &Log("Re-entering main event loop after 1s delay, following unexpected main event loop termination");
+   }
+   else {
+      my $E = ref($@) ? &Dumper($@) : $@;
+      &Log("Re-entering main event loop after 1s delay, following main event loop exception '$@'");
+   }
+
+   sleep 1;
+}
+
+# This line should never be reached
+&Log("Exiting main event loop");
+
+1;
