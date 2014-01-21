@@ -180,7 +180,8 @@ our $NP_GLOBAL = { 'HostCheckers' => {},
                                   },
                                   'Log' => { 'Path'   => "/var/log/ipvs-weightman.log",
                                              'SysLog' => 0,
-                                             'StdErr' => 0
+                                             'StdErr' => 0,
+                                             'Level'  => 1
                                   },
                                   'Ramping' => { 'TriggerTime' => 120,
                                                  'Duration'    => 10,
@@ -426,7 +427,7 @@ sub Cmd {
 
    $E = -10 if $err =~ /Destination already exists/i;
 
-   &Log($Lg) if $GLOBAL->{'Log'}->{'Level'} >= 10 || $E;
+   &Log($Lg) if $NP_OPTIONS->{'Log'}->{'Level'} >= 10 || $E;
 
    return $E;
 }
@@ -667,7 +668,7 @@ sub IPVS_Eval_Desired_Weight {
       delete $HostSVC->{'WeightRampDeadline'};
 
       &Log("$LogVS$Reason: Setting DesiredWeight=0")
-        if $HostSVC->{'State'}->{'Weight'} != 0 || $GLOBAL->{'Log'}->{'Level'} >= 10;
+        if $HostSVC->{'State'}->{'Weight'} != 0 || $NP_OPTIONS->{'Log'}->{'Level'} >= 10;
 
       unless( exists $HostSVC->{'TimeDisabled'} ) {
          $HostSVC->{'TimeDisabled'} = time;
@@ -711,7 +712,7 @@ sub IPVS_Eval_Desired_Weight {
    if( !$HostSVC->{'WeightRampDuration'} ) {
 
       &Log("$LogVS: Setting DesiredWeight=$HostSVC->{'Weight'}")
-        if $HostSVC->{'State'}->{'DesiredWeight'} != $HostSVC->{'Weight'} || $GLOBAL->{'Log'}->{'Level'} >= 10;
+        if $HostSVC->{'State'}->{'DesiredWeight'} != $HostSVC->{'Weight'} || $NP_OPTIONS->{'Log'}->{'Level'} >= 10;
 
       # Transition complete.
       $HostSVC->{'TStatus'} = '0-ENABLED';
@@ -1565,7 +1566,7 @@ sub OnEvent {
          my $ResponseText;
 
          if( ref $ResponseData eq 'HASH' && exists $ResponseData->{'Code'} ) {
-            if( $GLOBAL->{'Log'}->{'Level'} >= 5 ) {
+            if( $NP_OPTIONS->{'Log'}->{'Level'} >= 5 ) {
                $ResponseText = $ResponseData->{'Code'} . '|' . $ResponseData->{'Msg'};
                my $Body = $ResponseData->{'Body'};
                $Body =~ s/\n/<LF>/sg;
@@ -1582,8 +1583,8 @@ sub OnEvent {
          $ResponseText = $Status . ( $ResponseText && ( ' (' . $ResponseText . ')' ) );
 
          &Log( sprintf "Received from checker '%s/%s' (PID %d): %s", $thing->{'.Title'}, $thing->{'.Args'}->{'Path'}, $thing->{'.PID'}, $ResponseText )
-           if $GLOBAL->{'Log'}->{'Level'} >= 6
-              || ( $GLOBAL->{'Log'}->{'Level'} >= 5 && $HOSTS->{ $thing->Title }->{'Checkers'}->{ $thing->{'.Args'}->{'Path'} }->{'Status'} ne $Status );
+           if $NP_OPTIONS->{'Log'}->{'Level'} >= 6
+              || ( $NP_OPTIONS->{'Log'}->{'Level'} >= 5 && $HOSTS->{ $thing->Title }->{'Checkers'}->{ $thing->{'.Args'}->{'Path'} }->{'Status'} ne $Status );
 
          $HOSTS->{ $thing->Title }->{'Checkers'}->{ $thing->{'.Args'}->{'Path'} }->{'Status'}     = $Status;
          $HOSTS->{ $thing->Title }->{'Checkers'}->{ $thing->{'.Args'}->{'Path'} }->{'LastUpdate'} = $ResponseTime;
@@ -1896,14 +1897,6 @@ sub OnEvent {
             }
             &$OutFn( join( ' ', sort keys %Hosts ) . "\n" );
          }
-
-         # log level <n>
-         elsif ( $Msg =~ /^log\s+level\s+(\d+)$/i ) {
-            $GLOBAL->{'Log'}->{'Level'} = $1;
-
-            # (tied $GLOBAL)->sync();
-            &$OutFn("Log Level set to '$1'\n");
-         }
          elsif ( $Msg =~ /^(q(uit)?|exit|\x04)$/i ) {
             $thing->destroy;
             return;
@@ -2017,9 +2010,8 @@ unless(
 my $Tie = tie( $GLOBAL, 'Tie::Persistent', $NP_OPTIONS->{'DB'}, 'rw' ) || &Log("Cannot open '$NP_OPTIONS->{'DB'}' because '$!'");
 ( tied $GLOBAL )->autosync(0);
 
-$GLOBAL->{'Hosts'}          = {} unless $GLOBAL->{'Hosts'};
-$GLOBAL->{'VSs'}            = {} unless $GLOBAL->{'VSs'};
-$GLOBAL->{'Log'}->{'Level'} = 1  unless exists $GLOBAL->{'Log'}->{'Level'};
+$GLOBAL->{'Hosts'} = {} unless $GLOBAL->{'Hosts'};
+$GLOBAL->{'VSs'}   = {} unless $GLOBAL->{'VSs'};
 
 # Process VSs and Hosts, and reprocess Options
 &config_reload(2);
